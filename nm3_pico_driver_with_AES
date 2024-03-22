@@ -1,35 +1,41 @@
 #########################################################################################################
-# Filename      : nm3_pico_driver.py                                                                    #
-# Version       : 0.1.0                                                                                 #
+# Filename      : nm3_pico_driver_with_AES.py                                                                    #
+# Version       : 0.3.0                                                                                 #
 # Description   : Driver for interfacing with the NanoModem V3.2 acoustic modem on Raspberry Pi Pico W. #
 #                 Using AES Encryption                                                                  #
 # Author        : Dean Rowlett                                                                          #
 # Target        : Raspberry Pi Pico W with MicroPython                                                  #
 # Interpreter   : MicroPython v1.22.1                                                                   #
 # IDE           : Thonny 4.1.4                                                                          #
-# Last Updated  : 11th February 2024                                                                    #
+# Last Updated  : 22nd February 2024                                                                    #
 #########################################################################################################
+
 from machine import UART, Pin
 import time
 from ucryptolib import aes
 import hashlib
+import os
+
 # Global debug flag
 debug = False
-
+TIMEOUT_SECONDS = 2
 def debug_print(message):
     if debug:
         print(message)
         
 class NM3Driver:
-    def __init__(self, uart_id=0, baudrate=9600, tx_pin=16, rx_pin=17):
+    def __init__(self, uart_id=0, baudrate=9600,  passphrase=""):
         self.uart = UART(uart_id, baudrate=baudrate)
+        self.key = self.generate_key(passphrase)
+        self.iv = os.urandom(16)  # Initialization Vector for AES
+
+    def generate_key(self, passphrase):
+        # Generate a 32-byte (256-bit) AES key from the passphrase
+        return hashlib.sha256(passphrase.encode()).digest()
 
     def connect(self):
         # Specify TX and RX pins during connection
-        self.uart.init(baudrate=9600, bits=8, parity=None, stop=1, tx=Pin(16), rx=Pin(17))
-
-    def send_command(self, command):
-        self.uart.write(command.encode('utf-8'))
+        self.uart.init(baudrate=9600, bits=8, parity=None, stop=1)
 
     def read_response(self, timeout=2):
         end_time = time.ticks_add(time.ticks_ms(), timeout * 1000)
@@ -38,22 +44,50 @@ class NM3Driver:
             if self.uart.any():
                 byte = self.uart.read()
                 response.extend(byte)
-                debug_print(f"Data Received: {response}")
                 if response.endswith(b'\r\n'):  # End of message
                     break
-        return response.decode()
+        # Decrypt the response
+        decrypted_response = self.decrypt(response)
+        return decrypted_response.decode('utf-8')
+
+    def encrypt(self, plaintext):
+        # Generate a new IV for each encryption to enhance security
+        iv = os.urandom(16)
+        cipher = aes(self.key, 2, iv)  # AES-256-CBC mode
+        padded_plaintext = plaintext + (16 - len(plaintext) % 16) * chr(16 - len(plaintext) % 16)
+        ciphertext = cipher.encrypt(padded_plaintext)
+        # Return IV + ciphertext, hex-encoded for transmission
+        return iv.hex() + ciphertext.hex()
+
+    def send_command(self, command):
+        # Encrypt the command before sending, including the IV in the encrypted command
+        encrypted_command = self.encrypt(command)
+        # No change needed here if UART.write can accept the length of the encrypted command
+        self.uart.write(bytes.fromhex(encrypted_command))  # Ensure binary data is sent over UART
+
+    def decrypt(self, encrypted_hex):
+        # Split IV and ciphertext from the input hex data
+        iv = bytes.fromhex(encrypted_hex[:32])  # IV is first 16 bytes, hex-encoded
+        ciphertext = bytes.fromhex(encrypted_hex[32:])
+        cipher = aes(self.key, 2, iv)
+        padded_plaintext = cipher.decrypt(ciphertext)
+        # Remove PKCS#7 padding
+        pad_len = padded_plaintext[-1]
+        plaintext = padded_plaintext[:-pad_len]
+        return plaintext
 
 
     def get_address(self):
-        self.send_command('$?')
-        response = self.read_response()
-        if not response:
-            raise Exception("No Response")
-        if response.startswith('#A'):
-            addr = response.split('V')[0][2:]
-            return int(addr)
-        if not response.startswith('#A'):
-            raise Exception("Incorrect Response")
+            self.send_command('$?')
+            response = self.read_response()
+            if not response:
+                raise Exception("No Response")
+            if response.startswith('#A'):
+                addr = response.split('V')[0][2:]
+                return int(addr)
+            if not response.startswith('#A'):
+                raise Exception("Incorrect Response")
+            
     def get_voltage(self, address):
         command = f"$V{address:03d}"
         debug_print(f"Voltage Command: {command}")
@@ -112,56 +146,19 @@ class NM3Driver:
         else:
             debug_print(f"Unexpected response: {response}")
             return None
-        
     def send_unicast_message(self, address, message):
-        message_length = len(message)
-        command = f"$U{address:03d}{message_length:02d}{message}"
+        # Encrypt message before sending
+        encrypted_message = self.encrypt(message)
+        # Preparing command with encrypted message
+        message_length = len(encrypted_message) // 2  # Length in bytes after converting hex string
+        command = f"$U{address:03d}{message_length:02d}{encrypted_message}"
+        debug_print(f"Sending Encrypted Command: {command}")
         self.send_command(command)
-        debug_print(f"Sending Command: {command}")
         return self.read_response()
 
-    # Modify AESCipher to handle padding correctly and ensure it fits the use case
-    class AESCipher:
-        def __init__(self, passphrase, iv):
-            self.key = self.generate_key(passphrase)
-            self.iv = iv
+try:
+    from secrets import PASSPHRASE
+except ImportError:
+    print("Secrets file not found. ")
 
-        def generate_key(self, passphrase):
-            hashed_passphrase = hashlib.sha256(passphrase.encode()).digest()
-            return hashed_passphrase
-
-        def encrypt(self, plaintext):
-            debug_print(f"Encrypting plaintext: {plaintext}")
-            cipher = aes(self.key, 2, self.iv)  # AES-256-CBC mode
-            # Pad plaintext for encryption to make its length a multiple of 16 bytes
-            padded_plaintext = plaintext + b'\0' * (16 - len(plaintext) % 16)
-            ciphertext = cipher.encrypt(padded_plaintext)
-            debug_print(f"Encrypt Cipher Length: {len(ciphertext)}")
-            debug_print(f"Ciphertext: {ciphertext}")
-            return ciphertext
-
-
-        def decrypt(self, ciphertext):
-            debug_print(f"Decrypting ciphertext: {ciphertext}")
-            debug_print(f"Decrypt Cipher Length: {len(ciphertext)}")
-            # Check if the ciphertext length is a multiple of 16
-            if len(ciphertext) % 16 != 0:
-                debug_print("Ciphertext block size is not a multiple of 16 bytes. Skipping decryption.")
-                return ciphertext  # Optionally handle this case differently
-            cipher = aes(self.key, 2, self.iv)
-            decrypted_plaintext = cipher.decrypt(ciphertext)
-            debug_print(f"Decrypted plaintext: {decrypted_plaintext}")
-            return decrypted_plaintext.rstrip(b'\r\n\0')
-
-
-# Pass the cipher instance when creating the NM3Driver object
-pico = NM3Driver(uart_id=0, baudrate=9600, tx_pin=16, rx_pin=17)
-# Now you can proceed with the rest of your operations
-pico.connect()
-voltage = pico.get_voltage(115)
-print(f"Votlage on 115: {voltage}")
-address = pico.get_address()
-print(f"Address: {address}")
-ping = pico.ping(115)
-print(f"Distance to 115: {ping}")
-#pico.send_unicast_message(169, "Test")
+nm3_driver = NM3Driver(uart_id=0, baudrate=9600, passphrase=PASSPHRASE)
